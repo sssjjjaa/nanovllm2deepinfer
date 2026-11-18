@@ -33,6 +33,7 @@ def make_scheduler(num_blocks=64, block_size=4, max_num_seqs=8, max_num_batched_
     cfg = SimpleNamespace(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=4096,
         eos=-1,
         kvcache_block_size=block_size,
         num_kvcache_blocks=num_blocks,
