@@ -1,0 +1,4 @@
+# 这些脚本要在 Linux（Modal / 一〇七）上跑，CRLF 会让 bash 报 "$'\r': command not found"
+*.sh text eol=lf
+*.sbatch text eol=lf
+*.py text eol=lf

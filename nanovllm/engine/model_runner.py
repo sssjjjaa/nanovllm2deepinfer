@@ -1,4 +1,5 @@
 import pickle
+from time import perf_counter
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -25,6 +26,8 @@ class ModelRunner:
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        self.events = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+        self.last_timing = {}
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
@@ -212,10 +215,26 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        t0 = perf_counter()
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        t1 = perf_counter()
+        self.events[0].record()
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        self.events[1].record()
+        t2 = perf_counter()
+        tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
+        self.events[2].record()
+        token_ids = tokens.tolist() if self.rank == 0 else None
+        t3 = perf_counter()
+        if self.rank == 0:
+            self.last_timing = {
+                "cpu_prepare": t1 - t0,
+                "cpu_launch": t2 - t1,
+                "cpu_sample_wait": t3 - t2,
+                "gpu_forward": self.events[0].elapsed_time(self.events[1]) / 1000,
+                "gpu_sample": self.events[1].elapsed_time(self.events[2]) / 1000,
+            }
         reset_context()
         return token_ids
 
