@@ -1,8 +1,15 @@
 from collections import deque
+from enum import IntEnum
 import xxhash
 import numpy as np
 
 from nanovllm.engine.sequence import Sequence
+
+
+class AllocStatus(IntEnum):
+    OK = 0
+    LATER = 1
+    NEVER = 2
 
 
 class Block:
@@ -55,7 +62,11 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def can_allocate(self, seq: Sequence) -> tuple[AllocStatus, int]:
+        # 用请求需要的总块数判断 NEVER，不是扣掉前缀缓存命中之后的 num_new_blocks：
+        # 命中的块也占 cache。条件用 >=，因为 decode 至少还要再要一块。
+        if seq.num_blocks >= len(self.blocks):
+            return AllocStatus.NEVER, 0
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -69,8 +80,8 @@ class BlockManager:
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
         if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
+            return AllocStatus.LATER, 0
+        return AllocStatus.OK, num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table

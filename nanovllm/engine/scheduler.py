@@ -1,8 +1,8 @@
 from collections import deque
 
 from nanovllm.config import Config
+from nanovllm.engine.block_manager import AllocStatus, BlockManager
 from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
@@ -10,6 +10,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_model_len = config.max_model_len
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -22,9 +23,31 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        # 长度检查提前到入队：给 decode 至少留一个位置。
+        if seq.num_prompt_tokens > self.max_model_len - 1:
+            seq.status = SequenceStatus.FINISHED_IGNORED
         self.waiting.append(seq)
 
+    def abort(self, seq_ids: list[int]):
+        """只打标记，不动队列、不释放 block：这个请求可能还在 GPU 上跑。"""
+        ids = set(seq_ids)
+        for seq in list(self.waiting) + list(self.running):
+            if seq.seq_id in ids and not seq.is_finished:
+                seq.status = SequenceStatus.FINISHED_ABORTED
+
+    def free_finished(self):
+        """只出队，不释放 block。释放由 LLMEngine.step() 在 run 返回之后做。"""
+        for seq in list(self.waiting):
+            if seq.is_finished:
+                self.waiting.remove(seq)
+                self.finished.append(seq)
+        for seq in list(self.running):
+            if seq.is_finished:
+                self.running.remove(seq)
+                self.finished.append(seq)
+
     def schedule(self) -> tuple[list[Sequence], bool]:
+        self.free_finished()
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -35,8 +58,14 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
+                status, num_cached_blocks = self.block_manager.can_allocate(seq)
+                if status == AllocStatus.NEVER:
+                    # 永远放不下：当场拒绝，别把队头堵住
+                    self.waiting.popleft()
+                    seq.status = SequenceStatus.FINISHED_IGNORED
+                    self.finished.append(seq)
+                    continue
+                if status == AllocStatus.LATER:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
@@ -55,6 +84,9 @@ class Scheduler:
 
         if scheduled_seqs:
             return scheduled_seqs, True
+        if not self.running:
+            # 全被取消 / 拒绝了：返回空步，别掉进 decode 分支的 assert
+            return [], False
 
         # decode
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
@@ -70,7 +102,8 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        if not scheduled_seqs:
+            return [], False
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
@@ -83,15 +116,19 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+        """只判定结局，不出队、不释放。"""
         for seq, token_id in zip(seqs, token_ids):
+            if seq.is_finished:  # abort 可能在本步 run 之前就打上了标记
+                continue
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
-                self.finished.append(seq)
+            if seq.num_tokens >= self.max_model_len:
+                seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+            elif not seq.ignore_eos and token_id == self.eos:
+                seq.status = SequenceStatus.FINISHED_STOPPED
+            elif seq.num_completion_tokens == seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
