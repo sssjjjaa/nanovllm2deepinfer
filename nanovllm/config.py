@@ -16,6 +16,13 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # 2.2：prefill 不再每步都做。每 prefill_attempt_interval 个 decode 步
+    # 才尝试一次，且 KV 用量要在这条水位线以下（按 block 数算，不按 token）。
+    prefill_attempt_interval: int = 70
+    prefill_watermark: float = 0.9
+    # 2.3：被抢占的请求是重算（False）还是直接结束（True）。
+    # 有 prefill 通道的引擎可以重算；没有 prefill 通道的 decode 机器必须开。
+    stop_preempted_request: bool = False
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

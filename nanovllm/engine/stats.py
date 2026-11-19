@@ -24,6 +24,8 @@ class StepRecord:
     seq_ids: list[int] = field(default_factory=list)
     finished: list[int] = field(default_factory=list)
     preempted: list[int] = field(default_factory=list)
+    # 这一步被抢占的请求要重算多少 token（2.3：白算的量）
+    recomputed_tokens: int = 0
 
     @property
     def gpu_busy(self):

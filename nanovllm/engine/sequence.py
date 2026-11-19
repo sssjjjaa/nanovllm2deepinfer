@@ -1,15 +1,28 @@
 from copy import copy
-from enum import Enum, auto
+from enum import IntEnum
 from itertools import count
 from time import perf_counter
 
 from nanovllm.sampling_params import SamplingParams
 
 
-class SequenceStatus(Enum):
-    WAITING = auto()
-    RUNNING = auto()
-    FINISHED = auto()
+class SequenceStatus(IntEnum):
+    WAITING = 0
+    RUNNING = 1
+    FINISHED_STOPPED = 2
+    FINISHED_LENGTH_CAPPED = 3
+    FINISHED_ABORTED = 4
+    FINISHED_IGNORED = 5
+    FINISHED_PREEMPTED = 6
+
+
+FINISH_REASONS = {
+    SequenceStatus.FINISHED_STOPPED: "stop",
+    SequenceStatus.FINISHED_LENGTH_CAPPED: "length",
+    SequenceStatus.FINISHED_ABORTED: "abort",
+    SequenceStatus.FINISHED_IGNORED: "prompt_length_exceeded",
+    SequenceStatus.FINISHED_PREEMPTED: "insufficient_system_resource",
+}
 
 
 class Sequence:
@@ -25,6 +38,7 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
+        self.total_inflight_tokens = 0
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature
@@ -42,7 +56,11 @@ class Sequence:
 
     @property
     def is_finished(self):
-        return self.status == SequenceStatus.FINISHED
+        return self.status >= SequenceStatus.FINISHED_STOPPED
+
+    @property
+    def finish_reason(self):
+        return FINISH_REASONS.get(self.status)
 
     @property
     def num_completion_tokens(self):
@@ -58,7 +76,7 @@ class Sequence:
 
     @property
     def num_blocks(self):
-        return (self.num_tokens + self.block_size - 1) // self.block_size
+        return (self.num_tokens + self.total_inflight_tokens + self.block_size - 1) // self.block_size
 
     @property
     def last_block_num_tokens(self):
@@ -73,6 +91,19 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
         self.token_times.append(perf_counter())
+
+    def reset_for_recompute(self):
+        """被抢占后回到 waiting 队头，等下一个人重新 prefill 一遍。
+
+        只清"算过多少"的记账，不动 token_ids 和 num_prompt_tokens：
+        已经吐出来的 token 是用户看到的，不能丢；max_tokens 照原来的
+        进度继续算。
+        """
+        self.status = SequenceStatus.WAITING
+        self.num_cached_tokens = 0
+        self.num_scheduled_tokens = 0
+        self.total_inflight_tokens = 0
+        self.is_prefill = True
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids

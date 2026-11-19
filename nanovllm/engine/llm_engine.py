@@ -50,18 +50,29 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
+    def abort_request(self, seq_ids: int | list[int]):
+        self.scheduler.abort(seq_ids if isinstance(seq_ids, list) else [seq_ids])
+
     def step(self):
         t0 = perf_counter()
         seqs, is_prefill = self.scheduler.schedule()
         t1 = perf_counter()
+        finished = self.scheduler.finished
+        self.scheduler.finished = []
+        preempted = self.scheduler.preempted
+        self.scheduler.preempted = []
+        recomputed_tokens = self.scheduler.recomputed_tokens
+        self.scheduler.recomputed_tokens = 0
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        timing = self.model_runner.last_timing
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        timing = None
+        if seqs:
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            timing = self.model_runner.last_timing
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
         t2 = perf_counter()
-        finished, preempted = self.scheduler.finished, self.scheduler.preempted
-        self.scheduler.finished, self.scheduler.preempted = [], []
+        # 释放放在 run 返回之后：GPU 可能还在读这些 block（2.7 的 ZOS 会放大这一点）
         for seq in finished:
+            self.scheduler.block_manager.deallocate(seq)
             self.request_records.append(RequestRecord(
                 seq_id=seq.seq_id,
                 num_prompt_tokens=seq.num_prompt_tokens,
@@ -70,30 +81,32 @@ class LLMEngine:
                 finish_time=perf_counter(),
                 token_times=list(seq.token_times),
                 num_preemptions=seq.num_preemptions,
-                finish_reason="length" if seq.num_completion_tokens >= seq.max_tokens else "stop",
+                finish_reason=seq.finish_reason,
             ))
-        cpu_runner = timing["cpu_prepare"] + timing["cpu_launch"] + timing["cpu_sample_wait"]
-        record = StepRecord(
-            step_id=len(self.step_records),
-            is_prefill=is_prefill,
-            num_seqs=len(seqs),
-            num_tokens=abs(num_tokens),
-            wall=t2 - t0,
-            cpu_schedule=t1 - t0,
-            cpu_prepare=timing["cpu_prepare"],
-            cpu_launch=timing["cpu_launch"],
-            cpu_sample_wait=timing["cpu_sample_wait"],
-            gpu_forward=timing["gpu_forward"],
-            gpu_sample=timing["gpu_sample"],
-            cpu_postprocess=max(t2 - t0 - (t1 - t0) - cpu_runner, 0.),
-            seq_ids=[seq.seq_id for seq in seqs],
-            finished=[seq.seq_id for seq in finished],
-            preempted=list(preempted),
-        )
-        self.step_records.append(record)
-        if self.trace is not None:
-            self.trace(record)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids, seq.finish_reason) for seq in finished]
+        if seqs:
+            cpu_runner = timing["cpu_prepare"] + timing["cpu_launch"] + timing["cpu_sample_wait"]
+            record = StepRecord(
+                step_id=len(self.step_records),
+                is_prefill=is_prefill,
+                num_seqs=len(seqs),
+                num_tokens=abs(num_tokens),
+                wall=t2 - t0,
+                cpu_schedule=t1 - t0,
+                cpu_prepare=timing["cpu_prepare"],
+                cpu_launch=timing["cpu_launch"],
+                cpu_sample_wait=timing["cpu_sample_wait"],
+                gpu_forward=timing["gpu_forward"],
+                gpu_sample=timing["gpu_sample"],
+                cpu_postprocess=max(t2 - t0 - (t1 - t0) - cpu_runner, 0.),
+                seq_ids=[seq.seq_id for seq in seqs],
+                finished=[seq.seq_id for seq in finished],
+                preempted=list(preempted),
+                recomputed_tokens=recomputed_tokens,
+            )
+            self.step_records.append(record)
+            if self.trace is not None:
+                self.trace(record)
         return outputs, num_tokens
 
     def is_finished(self):
@@ -123,7 +136,7 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
+            for seq_id, token_ids, _ in output:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()
