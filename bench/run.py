@@ -27,6 +27,7 @@ def build_engine(args):
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        stop_preempted_request=args.stop_preempted_request,
     )
 
 
@@ -92,6 +93,8 @@ def main():
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--stop-preempted-request", action="store_true",
+                        help="被抢占的请求直接结束，不重算（2.3）")
     args = parser.parse_args()
 
     specs = workloads.load(args.scenario, args.seed)

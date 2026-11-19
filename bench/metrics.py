@@ -41,6 +41,8 @@ def summarize_steps(records: list) -> dict:
     out = {
         "num_steps": len(records),
         "preemptions": sum(len(r.preempted) for r in records),
+        # 2.3：被抢占的请求要重算多少 token = 白算的量
+        "recomputed_tokens": sum(getattr(r, "recomputed_tokens", 0) for r in records),
     }
     for group, is_prefill in (("prefill", True), ("decode", False)):
         rs = [r for r in records if r.is_prefill == is_prefill]
@@ -101,4 +103,8 @@ def format_report(summary: dict) -> str:
                  f"max={_ms(requests['tbt']['max'])}")
     lines.append(f"  latency(s) p50={requests['latency']['p50']:.2f} p99={requests['latency']['p99']:.2f}")
     lines.append(f"  preempted={requests['preempted_requests']} 个请求 / {requests['preemptions']} 次")
+    recomputed = steps.get("recomputed_tokens", 0)
+    if recomputed:
+        total = summary.get("total_tokens", 0) or 1
+        lines.append(f"  recomputed={recomputed} tok = 产出的 {recomputed / total * 100:.1f}%")
     return "\n".join(lines)

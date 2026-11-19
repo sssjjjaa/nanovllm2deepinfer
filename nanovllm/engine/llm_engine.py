@@ -61,6 +61,8 @@ class LLMEngine:
         self.scheduler.finished = []
         preempted = self.scheduler.preempted
         self.scheduler.preempted = []
+        recomputed_tokens = self.scheduler.recomputed_tokens
+        self.scheduler.recomputed_tokens = 0
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         timing = None
         if seqs:
@@ -100,6 +102,7 @@ class LLMEngine:
                 seq_ids=[seq.seq_id for seq in seqs],
                 finished=[seq.seq_id for seq in finished],
                 preempted=list(preempted),
+                recomputed_tokens=recomputed_tokens,
             )
             self.step_records.append(record)
             if self.trace is not None:

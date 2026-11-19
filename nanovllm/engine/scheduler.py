@@ -16,7 +16,10 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.prefill_attempt_interval = config.prefill_attempt_interval
         self.prefill_watermark = config.prefill_watermark
+        self.stop_preempted_request = getattr(config, "stop_preempted_request", False)
         self.decode_step = 0
+        # 每一步被抢占要重算的 token 数之和（2.3 的验收指标）
+        self.recomputed_tokens = 0
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.finished: list[Sequence] = []
@@ -130,32 +133,52 @@ class Scheduler:
         return scheduled_seqs
 
     def _schedule_decode(self) -> list[Sequence]:
-        scheduled_seqs = []
+        """按输出长度降序排：尾部分配 block，头部踢人（踢输出最长的）。
+
+        为什么踢最长的：KV 满了以后空闲 block 只有两个来源 —— 有请求跑完，
+        或者有请求被踢。踢一个快跑完的，等于把"马上要永久还回来的 block"
+        换成"现在借出、以后还要拿回来，外加重算一遍"。输出最长的离跑完最近。
+        """
         if not self.running:
-            return scheduled_seqs
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
+            return []
+        running = sorted(self.running, key=lambda s: s.num_completion_tokens, reverse=True)
+        l, r = 0, len(running)
+        scheduled = []
+        while l < r and len(scheduled) < self.max_num_seqs:
+            seq = running[r - 1]          # 尾部：输出最短的
             while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
+                if r - l > 1:
+                    self.preempt(running[l])   # 头部：输出最长的
+                    l += 1
                 else:
-                    self.preempt(seq)
+                    self.preempt(seq)          # 只剩自己还放不下，踢自己
+                    r -= 1
                     break
             else:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs
+                scheduled.append(seq)
+                r -= 1
+        # 受 max_num_seqs 限制没轮到的要留在 running 里，不能丢
+        self.running = deque(running[l:r] + scheduled)
+        return scheduled
 
     def preempt(self, seq: Sequence):
-        seq.status = SequenceStatus.WAITING
-        seq.is_prefill = True
-        seq.num_preemptions += 1
+        """两条出路，都要当场把 block 还回去。
+
+        不立刻释放的话，同一步里紧跟着的 can_append 看不见这批 block，
+        当前这个请求还是放不下，只好把自己也踢掉 —— 白踢一个人。
+        """
         self.preempted.append(seq.seq_id)
+        self.recomputed_tokens += seq.num_tokens
+        seq.num_preemptions += 1
         self.block_manager.deallocate(seq)
+        if self.stop_preempted_request:
+            seq.status = SequenceStatus.FINISHED_PREEMPTED
+            self.finished.append(seq)
+            return
+        seq.reset_for_recompute()
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):

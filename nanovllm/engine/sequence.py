@@ -92,6 +92,19 @@ class Sequence:
         self.num_tokens += 1
         self.token_times.append(perf_counter())
 
+    def reset_for_recompute(self):
+        """被抢占后回到 waiting 队头，等下一个人重新 prefill 一遍。
+
+        只清"算过多少"的记账，不动 token_ids 和 num_prompt_tokens：
+        已经吐出来的 token 是用户看到的，不能丢；max_tokens 照原来的
+        进度继续算。
+        """
+        self.status = SequenceStatus.WAITING
+        self.num_cached_tokens = 0
+        self.num_scheduled_tokens = 0
+        self.total_inflight_tokens = 0
+        self.is_prefill = True
+
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
