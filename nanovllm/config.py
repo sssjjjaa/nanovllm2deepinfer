@@ -16,6 +16,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # 2.2：prefill 不再每步都做。每 prefill_attempt_interval 个 decode 步
+    # 才尝试一次，且 KV 用量要在这条水位线以下（按 block 数算，不按 token）。
+    prefill_attempt_interval: int = 70
+    prefill_watermark: float = 0.9
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
